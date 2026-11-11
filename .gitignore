@@ -29,6 +29,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Packed release artifacts (published as GitHub release assets)
+*.tgz
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*

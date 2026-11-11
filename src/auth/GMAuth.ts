@@ -10,7 +10,7 @@ import https from "https";
 
 import path from "path";
 import jwt from "jsonwebtoken";
-import { chromium, Browser, BrowserContext, Page } from "patchright";
+import { chromium, Browser, BrowserContext, Locator, Page } from "patchright";
 import { randomInt } from "crypto";
 import { execSync } from "child_process";
 import * as net from "net";
@@ -23,6 +23,129 @@ export function readJSONFile<T>(filePath: string): T {
   const raw = fs.readFileSync(filePath, "utf-8");
   const content = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
   return JSON.parse(content) as T;
+}
+
+// ── MFA (one-time passcode) helpers ─────────────────────────────────────────
+//
+// GM serves the "Verify it's you" step from an Azure AD B2C custom page. That
+// page has been re-skinned several times and, depending on the account's
+// enrolled methods, it is *not always* a code-entry page: it can first be a
+// method chooser ("email / text / authenticator app"). The original
+// implementation hard-coded three `name=` attributes from the 2024 page
+// (`otpCode`, `emailMfa`, `strongAuthenticationPhoneNumber`) and waited 60s for
+// one of them, which turns every GM page change into a 60s timeout and, because
+// the timeout is not a "permanent" failure, a five-attempt login storm.
+//
+// The locator lists below are ordered most specific -> most generic and are
+// polled instead of being used in a single `waitForSelector`. Adding a new GM
+// page shape is a one-line change here, and `ONSTAR_DEBUG_MFA=1` dumps the real
+// DOM so the next change can be diagnosed from the pod instead of guessed.
+
+// Pure-CSS candidates (also used by the debug probe, which runs them through
+// `document.querySelectorAll` inside the page).
+export const MFA_CODE_FIELD_SELECTORS = [
+  'input[autocomplete="one-time-code"]',
+  'input[name="otpCode"]',
+  'input[id="otpCode"]',
+  'input[name*="otp" i]:not([type="hidden"])',
+  'input[id*="otp" i]:not([type="hidden"])',
+  'input[name*="verificationCode" i]:not([type="hidden"])',
+  'input[id*="verificationCode" i]:not([type="hidden"])',
+  'input[name*="code" i]:not([type="hidden"])',
+  'input[id*="code" i]:not([type="hidden"])',
+  'input[inputmode="numeric"]:not([type="hidden"])',
+  'input[type="tel"]:not([type="hidden"])',
+  '[aria-label*="one-time" i]',
+  '[aria-label*="verification code" i]',
+  '[aria-label*="OTP" i]',
+];
+
+// Method-chooser candidates. Playwright `:has-text()` is allowed here only —
+// the probe strips these and reports the pure-CSS subset.
+export const MFA_METHOD_SELECTORS = [
+  'button:has-text("authenticator")',
+  'a:has-text("authenticator")',
+  '[role="button"]:has-text("authenticator")',
+  'label:has-text("authenticator")',
+  'li:has-text("authenticator")',
+  '[id*="authenticator" i][role="button"]',
+  'button:has-text("verification code")',
+  'a:has-text("verification code")',
+  '[role="button"]:has-text("verification code")',
+  'button:has-text("use a code")',
+  'a:has-text("use a code")',
+  '[role="button"]:has-text("use a code")',
+  'button:has-text("one-time")',
+  'a:has-text("one-time")',
+  '[role="button"]:has-text("one-time")',
+];
+
+export const MFA_SUBMIT_SELECTORS = [
+  'button[type="submit"]',
+  'input[type="submit"]',
+  "button#continue",
+  "button#next",
+  "input#continue",
+  "input#next",
+  'button:has-text("Verify")',
+  'button:has-text("Continue")',
+  'button:has-text("Submit")',
+  'button:has-text("Next")',
+  'button:has-text("Sign in")',
+  '[role="button"]:has-text("Verify")',
+  '[role="button"]:has-text("Continue")',
+  '[role="button"]:has-text("Submit")',
+  '[role="button"]:has-text("Next")',
+];
+
+// Thrown for every failure that happens *on* the MFA page. `doFullAuthSequence`
+// treats it as permanent (no retry): re-driving the whole login cannot fix a
+// DOM mismatch and only feeds GM's bot detection.
+export class MfaError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "MfaError";
+    if (options?.cause !== undefined) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+/**
+ * Normalise an `ONSTAR_TOTP` value into a bare base32 key.
+ *
+ * Accepts a bare key (any case, optional spaces/dashes), a base32 key with `=`
+ * padding, and a full `otpauth://` URI — including the common Vaultwarden form
+ * where `secret=` is the LAST query parameter. The previous implementation used
+ * `secret=(.*?)&`, which captures nothing in that case and then failed the
+ * 16-character check against the whole URL, producing a misleading error for a
+ * perfectly valid seed.
+ *
+ * Exported for unit testing.
+ */
+export function normalizeTotpSecret(raw: string | undefined): string {
+  let secret = (raw ?? "").trim();
+
+  const otpauthQuery = secret.match(/[?&]secret=([^&]*)/i);
+  if (otpauthQuery) {
+    secret = otpauthQuery[1];
+  }
+
+  secret = secret
+    .replace(/%3D/gi, "=")
+    .replace(/\s+/g, "")
+    .replace(/-/g, "")
+    .replace(/=+$/, "")
+    .toUpperCase();
+
+  if (!/^[A-Z2-7]+$/.test(secret) || secret.length !== 16) {
+    throw new Error(
+      "Provided TOTP Key does not meet expected key length. Key should be 16 alphanumeric characters (base32). " +
+        "Accepted forms: a bare 16-character base32 key, or an otpauth:// URI containing ?secret=<key>.",
+    );
+  }
+
+  return secret;
 }
 
 // Define an interface for the vehicle structure and the payload containing them
@@ -1521,6 +1644,11 @@ export class GMAuth {
           const isAccessDenied = lastError.message.includes("Access Denied");
           const isPermanentFailure =
             isAccessDenied ||
+            // Every failure on the MFA page itself: a DOM mismatch, an
+            // unrecognised page, a wrong MFA method, or a missed redirect.
+            // Re-driving the whole login cannot fix any of these and only
+            // feeds GM's bot detection.
+            lastError instanceof MfaError ||
             lastError.message.includes("Email MFA is not supported") ||
             lastError.message.includes("Only TOTP") ||
             lastError.message.includes("TOTP Key does not meet");
@@ -1582,7 +1710,7 @@ export class GMAuth {
     );
 
     if (!this.context || !this.currentPage) {
-      throw new Error(
+      throw new MfaError(
         "Browser context and page not initialized - call submitCredentials first",
       );
     }
@@ -1598,79 +1726,74 @@ export class GMAuth {
         "🔍 Scanning for multi-factor authentication (MFA) input elements...",
       );
 
-      // Look for MFA elements
-      await page.waitForSelector(
-        'input[name="otpCode"], input[name="emailMfa"], input[name="strongAuthenticationPhoneNumber"]',
-        { timeout: 60000 },
+      if (process.env.ONSTAR_DEBUG_MFA) {
+        await this.dumpMfaDebug(page, "mfa-landing");
+      }
+
+      // GM can serve a method chooser ("email / text / authenticator app")
+      // before the code page. Select the authenticator option first, otherwise
+      // the code field never renders.
+      const selectedMethod = await this.selectMfaMethodIfPresent(page);
+      if (selectedMethod) {
+        console.log(`➡️  MFA method selected: "${selectedMethod}"`);
+      }
+
+      console.log("🔍 Scanning for a one-time-code input...");
+      let codeField = await this.waitForAnyLocator(
+        page,
+        MFA_CODE_FIELD_SELECTORS,
+        30000,
       );
+
+      // Some builds render the chooser late; give it a second chance before
+      // declaring the page unrecognised.
+      if (!codeField && (await this.selectMfaMethodIfPresent(page))) {
+        codeField = await this.waitForAnyLocator(
+          page,
+          MFA_CODE_FIELD_SELECTORS,
+          30000,
+        );
+      }
+
+      if (!codeField) {
+        const emailMfaVisible = await page
+          .locator('input[name="emailMfa"]')
+          .first()
+          .isVisible()
+          .catch(() => false);
+        const smsVisible = await page
+          .locator('input[name="strongAuthenticationPhoneNumber"]')
+          .first()
+          .isVisible()
+          .catch(() => false);
+
+        if (emailMfaVisible || smsVisible) {
+          throw new MfaError(
+            `Only TOTP via "Third-Party Authenticator" is currently supported by this implementation, but GM served the ${emailMfaVisible ? "email" : "SMS"} code page for this account. ` +
+              `Change the OnStar account's MFA method to "Third-Party Authenticator App" from a desktop browser, or use the seeded token cache.`,
+          );
+        }
+
+        const hiddenField = await this.waitForAnyLocator(
+          page,
+          MFA_CODE_FIELD_SELECTORS,
+          2000,
+          true,
+        );
+        throw new MfaError(
+          `MFA page ("${await page.title().catch(() => "unknown")}") has no recognised one-time-code input. ` +
+            (hiddenField
+              ? `A matching field exists but is not visible (selector: ${hiddenField.selector}). `
+              : "") +
+            `Re-run with ONSTAR_DEBUG_MFA=1 to dump the DOM and screenshot, then extend MFA_CODE_FIELD_SELECTORS.`,
+        );
+      }
 
       console.log(
-        "✅ MFA elements found - analyzing authentication method type",
+        `✅ MFA code input found via selector: ${codeField.selector}`,
       );
 
-      const pageContent = await page.content();
-
-      // Determine MFA type
-      let mfaType = null;
-      if (
-        (await page.locator('input[name="otpCode"]').count()) > 0 ||
-        pageContent.includes("otpCode")
-      ) {
-        mfaType = "TOTP";
-      } else if (
-        (await page.locator('input[name="emailMfa"]').count()) > 0 ||
-        pageContent.includes("emailMfa")
-      ) {
-        mfaType = "EMAIL";
-      } else if (
-        (await page
-          .locator('input[name="strongAuthenticationPhoneNumber"]')
-          .count()) > 0 ||
-        pageContent.includes("strongAuthenticationPhoneNumber")
-      ) {
-        mfaType = "SMS";
-      }
-
-      if (mfaType == null) {
-        throw new Error("Could not determine MFA Type. Bad email or password?");
-      }
-
-      if (mfaType != "TOTP") {
-        throw new Error(
-          `Only TOTP via "Third-Party Authenticator" is currently supported by this implementation. Please update your OnStar account to use this method, if possible.`,
-        );
-      }
-
-      // Generate TOTP code
-      var totp_secret = this.config.totpKey.trim();
-      // Handle instances where users blindly copy the TOTP link. We can just extract the key.
-      if (totp_secret.includes("secret=")) {
-        const match = this.getRegexMatch(totp_secret, "secret=(.*?)&");
-        totp_secret = match ?? totp_secret;
-      }
-      if (totp_secret.length != 16) {
-        throw new Error(
-          "Provided TOTP Key does not meet expected key length. Key should be 16 alphanumeric characters.",
-        );
-      }
-
-      const { otp } = await TOTP.generate(totp_secret, {
-        digits: 6,
-        algorithm: "SHA-1",
-        period: 30,
-      });
-
-      console.log("📱 Entering TOTP authentication code:", otp); // Fill in the OTP code
-      const otpField = await page
-        .locator(
-          'input[name="otpCode"], [aria-label*="One-Time Passcode"i], [aria-label*="OTP"i]',
-        )
-        .first();
-      await otpField.click({ delay: Math.random() * 200 + 50 });
-      await otpField.type(otp, { delay: Math.random() * 150 + 50 });
-      await page.waitForTimeout(500 + Math.random() * 500); // Pause before clicking
-
-      console.log("✅ TOTP code entered - preparing to submit MFA form");
+      const otp = await this.generateMfaCode();
 
       // Enable CDP Network domain for low-level network monitoring
       const client = await page.context().newCDPSession(page);
@@ -1749,37 +1872,63 @@ export class GMAuth {
       //   }
       // });
 
+      await this.fillMfaCode(page, codeField.locator, otp, codeField.selector);
+
       // Submit the MFA form
-      const submitMfaButton = await page // Renamed variable to avoid conflict
-        .locator(
-          'button[type="submit"], input[type="submit"], button:has-text("Verify"), button:has-text("Continue"), button:has-text("Submit"), [role="button"][aria-label*="Verify"i], [role="button"][aria-label*="Continue"i], [role="button"][aria-label*="Submit"i]',
-        )
-        .first();
-      await submitMfaButton.waitFor({ timeout: 60000 });
+      const submitMfaButton = await this.waitForAnyLocator(
+        page,
+        MFA_SUBMIT_SELECTORS,
+        30000,
+      );
+      if (!submitMfaButton) {
+        throw new MfaError(
+          "MFA submit control not found after entering the one-time code. " +
+            "Re-run with ONSTAR_DEBUG_MFA=1 and extend MFA_SUBMIT_SELECTORS.",
+        );
+      }
 
       console.log(
-        "✅ MFA submit button found - clicking to complete authentication",
+        `✅ MFA submit button found via selector: ${submitMfaButton.selector} - clicking to complete authentication`,
       );
-      await submitMfaButton.click();
+      await submitMfaButton.locator.click();
 
       if (this.debugMode)
         console.log("⌛ Waiting for redirect after MFA submission...");
-      await page.waitForLoadState("networkidle", { timeout: 60000 }); // Wait for potential redirects or network activity
+      await page
+        .waitForLoadState("networkidle", { timeout: 60000 })
+        .catch(() => undefined); // a custom-scheme redirect may abort navigation
 
       try {
+        // The redirect may already have happened between the click and the
+        // wait, in which case only the page URL holds the code.
+        const currentUrl = page.url();
+        if (
+          !this.capturedAuthCode &&
+          currentUrl
+            .toLowerCase()
+            .startsWith("msauth.com.gm.mychevrolet://auth")
+        ) {
+          this.capturedAuthCode = this.getRegexMatch(
+            currentUrl,
+            `[?&]code=([^&]*)`,
+          );
+        }
+
         // Wait for the auth code to be captured by CDP listeners
         if (this.debugMode)
           console.log(
             "⌛ Monitoring for authorization code capture after MFA submission...",
           );
         const captured = await this.waitForAuthCode(60000); // Use the new helper
-        if (!captured && this.debugMode) {
-          console.log(
-            "🚫 [handleMFA] Did not capture auth code after submit within timeout.",
+        if (!captured) {
+          throw new MfaError(
+            "MFA code was submitted but no authorization code was captured within 60s. " +
+              "This is usually a bot-detection/redirect problem, not a wrong OTP; retrying the login only makes it worse.",
           );
         }
       } catch (e) {
         console.error("🚫 [handleMFA] Error during waitForAuthCode:", e);
+        if (e instanceof MfaError) throw e;
       }
 
       try {
@@ -1802,9 +1951,272 @@ export class GMAuth {
         );
       }
     } catch (error) {
+      await this.dumpMfaDebug(page, "mfa-failure");
       console.error("Error in handleMFA:", error);
-      throw error;
+      if (error instanceof MfaError) {
+        throw error;
+      }
+      // Playwright timeouts / navigation errors are still MFA-page failures:
+      // wrap them so doFullAuthSequence does not re-drive the whole login.
+      throw new MfaError(
+        `MFA automation failed: ${(error as Error).message ?? String(error)}`,
+        { cause: error },
+      );
     }
+  }
+
+  /**
+   * Poll a list of candidate selectors until one matches a (visible, unless
+   * `allowHidden`) element. Never throws on a bad selector - one broken
+   * candidate must not hide the rest.
+   */
+  private async waitForAnyLocator(
+    page: Page,
+    selectors: string[],
+    timeoutMs: number,
+    allowHidden = false,
+  ): Promise<{ locator: Locator; selector: string } | null> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      for (const selector of selectors) {
+        let candidates: Locator;
+        try {
+          candidates = page.locator(selector);
+          const count = await candidates.count();
+          for (let i = 0; i < count; i++) {
+            const candidate = candidates.nth(i);
+            // `allowHidden` is the diagnostic path: report a field that exists
+            // but would not be usable, instead of treating it as absent.
+            const usable =
+              allowHidden || (await candidate.isVisible().catch(() => false));
+            if (usable) {
+              return { locator: candidate, selector };
+            }
+          }
+        } catch {
+          // Invalid/unsupported selector for this page - try the next one.
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        return null;
+      }
+      await page.waitForTimeout(500).catch(() => undefined);
+    }
+  }
+
+  /**
+   * GM's "Verify it's you" step is two different pages for authenticator-only
+   * accounts: a chooser, then the code field. Click the authenticator option
+   * when a chooser is present. Returns the clicked option's text (or null).
+   */
+  private async selectMfaMethodIfPresent(page: Page): Promise<string | null> {
+    for (const selector of MFA_METHOD_SELECTORS) {
+      let options: Locator;
+      try {
+        options = page.locator(selector);
+        const count = await options.count();
+        for (let i = 0; i < count; i++) {
+          const option = options.nth(i);
+          if (!(await option.isVisible().catch(() => false))) continue;
+
+          const text = ((await option.innerText().catch(() => "")) || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (!text || text.length > 160) continue;
+
+          // Never select an email/SMS delivery option by accident.
+          const isAuthenticator =
+            /authenticator|verification code|use a code|one-time code/i.test(
+              text,
+            );
+          const isOtherChannel =
+            /email|text message|sms|call me|phone call|voice/i.test(text);
+          if (!isAuthenticator || isOtherChannel) continue;
+
+          console.log(`🔐 Selecting MFA method: "${text}"`);
+          await option.click({ delay: Math.random() * 150 + 50 });
+          await page
+            .waitForLoadState("networkidle", { timeout: 30000 })
+            .catch(() => undefined);
+          return text;
+        }
+      } catch {
+        // Selector did not apply - keep looking.
+      }
+    }
+    return null;
+  }
+
+  private async generateMfaCode(): Promise<string> {
+    const totpSecret = normalizeTotpSecret(this.config.totpKey);
+    const { otp } = await TOTP.generate(totpSecret, {
+      digits: 6,
+      algorithm: "SHA-1",
+      period: 30,
+    });
+    // Never log the value: it is a live second factor for a few seconds.
+    console.log(
+      `📱 Generated ${String(otp).length}-digit TOTP code (value withheld from logs)`,
+    );
+    return String(otp);
+  }
+
+  /**
+   * Enter the code. Handles both a single input and the common
+   * one-box-per-digit variant, and verifies the field actually took the value.
+   */
+  private async fillMfaCode(
+    page: Page,
+    field: Locator,
+    otp: string,
+    selector: string,
+  ): Promise<void> {
+    await field.scrollIntoViewIfNeeded().catch(() => undefined);
+    await field
+      .click({ delay: Math.random() * 200 + 50 })
+      .catch(() => undefined);
+
+    const maxLength = await field
+      .evaluate((el) => (el as HTMLInputElement).maxLength ?? -1)
+      .catch(() => -1);
+    const isSplitInput = maxLength === 1;
+
+    if (isSplitInput) {
+      console.log(
+        "🔢 Detected one-box-per-digit OTP input; typing digits sequentially",
+      );
+      await page.keyboard.type(otp, { delay: Math.random() * 150 + 50 });
+    } else {
+      const filled = await field
+        .fill(otp)
+        .then(() => true)
+        .catch(() => false);
+      if (!filled) {
+        await field.type(otp, { delay: Math.random() * 150 + 50 });
+      }
+    }
+
+    await page.waitForTimeout(500 + Math.random() * 500);
+
+    if (!isSplitInput) {
+      const value = (await field.inputValue().catch(() => "")) || "";
+      if (value.replace(/\s+/g, "").length !== otp.length) {
+        throw new MfaError(
+          `MFA code was not accepted by the input field (selector: ${selector}). ` +
+            `Re-run with ONSTAR_DEBUG_MFA=1 to inspect the field.`,
+        );
+      }
+    }
+
+    console.log("✅ TOTP code entered - preparing to submit MFA form");
+  }
+
+  /**
+   * `ONSTAR_DEBUG_MFA=1` dumps the MFA page (DOM + screenshot + a selector
+   * report) next to the token cache, e.g. /persist/tokens/mfa-debug/.
+   * The DOM contains the signed-in account and any page tokens: treat it as
+   * sensitive and do not attach it to a public issue.
+   */
+  private async dumpMfaDebug(page: Page, tag: string): Promise<void> {
+    if (!process.env.ONSTAR_DEBUG_MFA) return;
+
+    const dir =
+      process.env.ONSTAR_MFA_DEBUG_DIR ||
+      path.join(path.dirname(this.MSTokenPath), "mfa-debug");
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const base = path.join(dir, `${tag}-${stamp}`);
+
+      const html = await page.content().catch(() => "");
+      fs.writeFileSync(`${base}.html`, html);
+      fs.writeFileSync(
+        `${base}.json`,
+        JSON.stringify(await this.probeMfaPage(page), null, 2),
+      );
+      await page
+        .screenshot({ path: `${base}.png`, fullPage: true })
+        .catch(() => undefined);
+
+      console.log(`🪵 [ONSTAR_DEBUG_MFA] wrote ${base}.{html,json,png}`);
+    } catch (error) {
+      console.warn("🪵 [ONSTAR_DEBUG_MFA] dump failed:", error);
+    }
+  }
+
+  /**
+   * Runs inside the page: inventories controls and evaluates every pure-CSS
+   * candidate selector, so a captured report is enough to fix the lists above.
+   */
+  private async probeMfaPage(page: Page): Promise<unknown> {
+    return page.evaluate(
+      (candidates: string[]) => {
+        const describe = (el: Element) => {
+          const input = el as HTMLInputElement;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          return {
+            tag: el.tagName.toLowerCase(),
+            type: input.type ?? null,
+            id: input.id || null,
+            name: input.name || null,
+            autocomplete: input.autocomplete || null,
+            inputmode: input.getAttribute("inputmode"),
+            maxLength: input.maxLength ?? null,
+            ariaLabel: el.getAttribute("aria-label"),
+            placeholder: input.placeholder || null,
+            text: (el.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 80),
+            visible:
+              style.visibility !== "hidden" &&
+              style.display !== "none" &&
+              rect.width > 0 &&
+              rect.height > 0,
+          };
+        };
+
+        const matches: Record<string, number> = {};
+        for (const selector of candidates) {
+          try {
+            matches[selector] = document.querySelectorAll(selector).length;
+          } catch {
+            matches[selector] = -1; // not valid CSS (e.g. :has-text())
+          }
+        }
+
+        return {
+          capturedAt: new Date().toISOString(),
+          url: location.href,
+          title: document.title,
+          headings: Array.from(
+            document.querySelectorAll("h1, h2, [role=heading]"),
+          )
+            .map((el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+            .filter(Boolean)
+            .slice(0, 10),
+          inputs: Array.from(
+            document.querySelectorAll("input, textarea, select"),
+          )
+            .map(describe)
+            .slice(0, 40),
+          buttons: Array.from(
+            document.querySelectorAll(
+              'button, [role="button"], a, input[type="submit"], input[type="button"]',
+            ),
+          )
+            .map(describe)
+            .filter((el) => el.visible && (el.text || el.id || el.ariaLabel))
+            .slice(0, 40),
+          selectorMatches: matches,
+        };
+      },
+      MFA_CODE_FIELD_SELECTORS.filter((s) => !s.includes(":has-text")),
+    );
   }
 
   private async syncCookiesFromBrowser(): Promise<void> {
