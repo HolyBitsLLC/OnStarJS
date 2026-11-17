@@ -21,16 +21,17 @@
 
 # Base pinned by digest as well as tag: the tag is mutable, the digest is what
 # was tested.
-FROM ghcr.io/bigthundersr/onstar2mqtt:2.8.4@sha256:0bf9587cc6b8f7d31861d8f81cf3bea398dc65063decb2afbdd0f9dde52c4a1a
+FROM ghcr.io/bigthundersr/onstar2mqtt:2.11.0@sha256:d37121037380ba4b9c33f240c656ef0cc83d18b5bb798bc4b80cf32494701747
 
 # Immutable release asset of HolyBitsLLC/OnStarJS, not an npm registry version:
 # the patch is ours and npm would resolve the unpatched 2.16.7.
 ARG ONSTARJS2_PATCH_URL=https://github.com/HolyBitsLLC/OnStarJS/releases/download/v2.16.7-holybits.1/onstarjs2-2.16.7-holybits.1.tgz
 ARG ONSTARJS2_PATCH_VERSION=2.16.7-holybits.1
 ARG ONSTARJS2_PATCH_SHA256=c6f1f11b7f677f7c304c34b6af6361deeaa6dfd661f1c3820e2b448b9f4d2c62
-# The patched onstarjs2 pins patchright exactly; upstream onstar2mqtt:2.8.4
-# overrides it to ^1.58.2, which would resolve to an incompatible browser
-# automation client. Keep these two in lockstep with the library's package.json.
+# The patched onstarjs2 pins patchright exactly. onstar2mqtt:2.11.0 already
+# overrides it to 1.60.2; the older 2.8.4 base overrode it to ^1.58.2, which
+# resolved to an incompatible browser automation client. Keep this in lockstep
+# with the library's package.json so a future base bump cannot silently drift.
 ARG PATCHRIGHT_VERSION=1.60.2
 
 USER root
